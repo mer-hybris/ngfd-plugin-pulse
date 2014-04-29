@@ -290,14 +290,14 @@ pulse_plugin_priv_cache_file (PulsePluginPriv *priv, const char *filename,
 }
 
 static void
-pulse_plugin_priv_play (PulsePluginPriv *priv, PulsePluginData *data,
+pulse_plugin_priv_play (PulsePluginPriv *priv, const char *filename,
         pulse_plugin_finished_cb finished_cb, void *user_data)
 {
     gboolean can_play = TRUE;
-    PLUGIN_DEBUG ("Would play: %s", data->filename);
+    PLUGIN_DEBUG ("Would play: %s", filename);
 
     // XXX: XDG Sound Theme Spec
-    gchar *fn = g_strdup_printf("/usr/share/sounds/jolla-ambient/stereo/%s.wav", data->filename);
+    gchar *fn = g_strdup_printf("/usr/share/sounds/jolla-ambient/stereo/%s.wav", filename);
 
     if (!g_file_test(fn, G_FILE_TEST_EXISTS)) {
         PLUGIN_WARNING ("File does not exist: %s", fn);
@@ -313,7 +313,7 @@ pulse_plugin_priv_play (PulsePluginPriv *priv, PulsePluginData *data,
 
     if (!g_hash_table_lookup (priv->cached_files, fn)) {
         PLUGIN_DEBUG ("Need to cache file: %s", fn);
-        if (!pulse_plugin_priv_cache_file (priv, fn, data->filename)) {
+        if (!pulse_plugin_priv_cache_file (priv, fn, filename)) {
             can_play = FALSE;
         }
     }
@@ -501,7 +501,7 @@ pulse_sink_play (NSinkInterface *iface, NRequest *request)
     PulsePluginData *data = (PulsePluginData*) n_request_get_data (request, PULSE_KEY);
     g_assert (data != NULL);
 
-    pulse_plugin_priv_play (priv, data, finished_callback, data);
+    pulse_plugin_priv_play (priv, data->filename, finished_callback, data);
 
     return TRUE;
 }
