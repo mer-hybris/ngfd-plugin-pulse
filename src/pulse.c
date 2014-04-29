@@ -38,6 +38,12 @@
 #define SOUND_FILENAME_KEY "canberra.filename"
 #define SOUND_VOLUME_KEY "sound.volume"
 
+// Maximum number of queued samples before silently dropping requests
+#define MAX_QUEUED_SAMPLES 0
+
+// Found through experimentation
+#define MINIMUM_STREAM_SIZE 2048
+
 N_PLUGIN_NAME        ("pulse")
 N_PLUGIN_VERSION     ("0.91.0")
 N_PLUGIN_DESCRIPTION ("Low-latency audio feedback via libsndfile and PulseAudio")
@@ -49,7 +55,7 @@ struct PulsePluginPriv {
     pa_proplist *proplist;
     SNDFILE *upload_file;
     GHashTable *cached_files;
-    int cached_files_seq;
+    int queued_samples;
 };
 
 typedef struct PulsePluginPriv PulsePluginPriv;
@@ -94,8 +100,12 @@ play_sample_callback (pa_context *context, uint32_t index, void *user_data)
 {
     PulsePluginPriv *priv = (PulsePluginPriv *)user_data;
 
+    priv->queued_samples--;
+
     if (index == PA_INVALID_INDEX) {
         PLUGIN_WARNING ("Failure playing sound!");
+    } else {
+        PLUGIN_DEBUG ("Sample playing completed, queued: %d", priv->queued_samples);
     }
 }
 
@@ -182,19 +192,18 @@ pulse_plugin_priv_connect (PulsePluginPriv *priv)
 }
 
 static gboolean
-pulse_plugin_priv_cache_file (PulsePluginPriv *priv, const char *filename)
+pulse_plugin_priv_cache_file (PulsePluginPriv *priv, const char *filename,
+        const char *sound_id)
 {
     PLUGIN_DEBUG ("Cache file proc: %s", filename);
 
     gboolean finished = FALSE;
     gboolean success = TRUE;
-    gchar *id = g_strdup_printf ("ngfd_pulse_%d", priv->cached_files_seq++);
+    gchar *id = g_strdup_printf ("ngfd_pulse_%s", sound_id);
 
     SF_INFO info;
     memset(&info, 0, sizeof(SF_INFO));
     SNDFILE *wav = sf_open(filename, SFM_READ, &info);
-
-    PLUGIN_DEBUG ("Opened sound file");
 
     if (!wav) {
         PLUGIN_WARNING ("Unable to open file: %s", filename);
@@ -215,13 +224,9 @@ pulse_plugin_priv_cache_file (PulsePluginPriv *priv, const char *filename)
     spec.channels = info.channels;
     spec.format = PA_SAMPLE_S16LE; // need support for big endian?
 
-    PLUGIN_DEBUG ("Rate: %d, channels: %d", spec.rate, spec.channels);
-
-    PLUGIN_DEBUG ("Creating new stream");
+    PLUGIN_DEBUG ("Creating new stream, rate: %d, channels: %d", spec.rate, spec.channels);
 
     pa_stream *stream = pa_stream_new (priv->context, id, &spec, NULL /* default channel map */);
-
-    PLUGIN_DEBUG ("Stream created");
 
     if (!stream) {
         PLUGIN_WARNING ("Unable to create stream for caching");
@@ -232,9 +237,11 @@ pulse_plugin_priv_cache_file (PulsePluginPriv *priv, const char *filename)
     pa_stream_set_state_callback (stream, stream_state_callback, priv);
     pa_stream_set_write_callback (stream, stream_write_callback, priv);
 
-    PLUGIN_DEBUG ("Connecting to upload stream (%d frames)", info.frames * 2);
+    size_t size = MAX(MINIMUM_STREAM_SIZE, info.frames * 2);
 
-    int ret = pa_stream_connect_upload (stream, info.frames * 2);
+    PLUGIN_DEBUG ("Connecting to upload stream (%d frames)", size);
+
+    int ret = pa_stream_connect_upload (stream, size);
     if (ret < 0) {
         PLUGIN_WARNING ("Failed to create upload stream");
         pa_stream_unref (stream);
@@ -244,17 +251,15 @@ pulse_plugin_priv_cache_file (PulsePluginPriv *priv, const char *filename)
 
     priv->upload_file = wav;
 
-    PLUGIN_DEBUG ("Uploading");
-
     while (!finished) {
         switch (pa_stream_get_state (stream)) {
             case PA_STREAM_FAILED:
-                PLUGIN_DEBUG ("Stream failed");
+                PLUGIN_DEBUG ("Upload of stream failed");
                 finished = TRUE;
                 success = FALSE;
                 break;
             case PA_STREAM_TERMINATED:
-                PLUGIN_DEBUG ("Stream successful");
+                PLUGIN_DEBUG ("Upload of stream successful");
                 finished = TRUE;
                 success = TRUE;
                 g_hash_table_insert (priv->cached_files,
@@ -265,10 +270,11 @@ pulse_plugin_priv_cache_file (PulsePluginPriv *priv, const char *filename)
                 break;
         }
 
-        if (!finished) {
-            PLUGIN_DEBUG ("Waiting... (%d)", pa_stream_get_state (stream));
-            pa_threaded_mainloop_wait(priv->mainloop);
+        if (finished) {
+            break;
         }
+
+        pa_threaded_mainloop_wait(priv->mainloop);
     }
 
     PLUGIN_DEBUG ("Upload done (success=%s)", success ? "true" : "false");
@@ -284,19 +290,17 @@ pulse_plugin_priv_cache_file (PulsePluginPriv *priv, const char *filename)
 }
 
 static void
-pulse_plugin_priv_play (PulsePluginPriv *priv, const char *filename,
+pulse_plugin_priv_play (PulsePluginPriv *priv, PulsePluginData *data,
         pulse_plugin_finished_cb finished_cb, void *user_data)
 {
     gboolean can_play = TRUE;
-    PLUGIN_DEBUG ("Would play: %s", filename);
+    PLUGIN_DEBUG ("Would play: %s", data->filename);
 
     // XXX: XDG Sound Theme Spec
-    gchar *fn = g_strdup_printf("/usr/share/sounds/jolla-ambient/stereo/%s.wav", filename);
+    gchar *fn = g_strdup_printf("/usr/share/sounds/jolla-ambient/stereo/%s.wav", data->filename);
 
-    if (g_file_test(fn, G_FILE_TEST_EXISTS)) {
-        PLUGIN_DEBUG ("File found: %s", fn);
-    } else {
-        PLUGIN_DEBUG ("File does not exist: %s", fn);
+    if (!g_file_test(fn, G_FILE_TEST_EXISTS)) {
+        PLUGIN_WARNING ("File does not exist: %s", fn);
         goto cleanup;
     }
 
@@ -309,19 +313,20 @@ pulse_plugin_priv_play (PulsePluginPriv *priv, const char *filename,
 
     if (!g_hash_table_lookup (priv->cached_files, fn)) {
         PLUGIN_DEBUG ("Need to cache file: %s", fn);
-        if (!pulse_plugin_priv_cache_file (priv, fn)) {
+        if (!pulse_plugin_priv_cache_file (priv, fn, data->filename)) {
             can_play = FALSE;
         }
-    } else {
-        PLUGIN_DEBUG ("Already cached: %s", fn);
     }
 
     if (!priv->valid) {
         PLUGIN_WARNING ("Cannot playback file: Invalid PulseAudio context");
     } else if (!can_play) {
         PLUGIN_WARNING ("Cannot playback file: Caching failed");
+    } else if (priv->queued_samples > MAX_QUEUED_SAMPLES) {
+        PLUGIN_DEBUG ("Skipping playback: Playback queue is full");
     } else {
         PLUGIN_DEBUG ("Playing sound effect: %s", fn);
+
         pa_operation *op = pa_context_play_sample_with_proplist(priv->context,
                 g_hash_table_lookup (priv->cached_files, fn),
                 NULL /* default sink */,
@@ -330,7 +335,10 @@ pulse_plugin_priv_play (PulsePluginPriv *priv, const char *filename,
                 play_sample_callback, priv);
 
         if (op) {
+            priv->queued_samples++;
             pa_operation_unref (op);
+        } else {
+            PLUGIN_WARNING ("Playback of cached sample failed");
         }
     }
 
@@ -340,10 +348,9 @@ cleanup:
     g_free(fn);
 
     if (finished_cb) {
-        finished_cb(user_data);
+        finished_cb (user_data);
     }
 }
-
 
 struct PulsePluginData {
     NRequest *request;
@@ -405,6 +412,8 @@ pulse_sink_shutdown (NSinkInterface *iface)
     PLUGIN_DEBUG ("sink shutdown");
 
     if (priv) {
+        // TODO: pa_context_remove_sample for all cached samples
+
         if (priv->cached_files) {
             g_hash_table_unref (priv->cached_files);
         }
@@ -439,7 +448,7 @@ pulse_sink_can_handle (NSinkInterface *iface, NRequest *request)
 
     props = (NProplist*) n_request_get_properties (request);
     if (n_proplist_has_key (props, SOUND_FILENAME_KEY)) {
-        PLUGIN_DEBUG ("request has a sound.filename, we can handle this.");
+        PLUGIN_DEBUG ("Request has %s, we can handle this.", SOUND_FILENAME_KEY);
         return TRUE;
     }
 
@@ -492,7 +501,7 @@ pulse_sink_play (NSinkInterface *iface, NRequest *request)
     PulsePluginData *data = (PulsePluginData*) n_request_get_data (request, PULSE_KEY);
     g_assert (data != NULL);
 
-    pulse_plugin_priv_play (priv, data->filename, finished_callback, data);
+    pulse_plugin_priv_play (priv, data, finished_callback, data);
 
     return TRUE;
 }
