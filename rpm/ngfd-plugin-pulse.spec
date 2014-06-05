@@ -1,6 +1,6 @@
 Name:       ngfd-plugin-pulse
 Summary:    PulseAudio sound effect plugin for ngfd
-Version:    0.91.0.1
+Version:    0.91.0.2
 Release:    1
 Group:      System/Daemons
 License:    LGPL 2.1
