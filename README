@@ -1,4 +1,2 @@
-Non-graphical feedback daemon: PulseAudio plugin
-------------------------------------------------
-
-Feedback sound playback using PulseAudio.
+This project has migrated to https://git.merproject.org/mer-core/ngfd-plugin-pulse
+as part of the Mer/Nemo merge work
